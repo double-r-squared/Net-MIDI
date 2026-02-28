@@ -1,60 +1,80 @@
-#include <pcap.h>
-#include <fstream>
+#include "user_interface.h"
+#include "network_capture.h"
+#include "file_parser.h"
+#include "midi_builder.h"
 #include <iostream>
+#include <cstdint>
 
-using namespace std;
-
-void packet_handler(u_char *user_data, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
-    ofstream *output_file = (ofstream*)user_data;
-    output_file->write((char*)packet, pkthdr->len);
-}
+// ============================================================================
+// MAIN: Orchestration logic
+// Responsible for: coordinating the workflow between modules
+// 
+// Workflow:
+// 1. Show UI welcome and get user parameters
+// 2. Capture network packets using NetworkCapture
+// 3. Parse captured file using FileParser
+// 4. Build MIDI using MidiBuilder
+// 5. Display completion message
+// ============================================================================
 
 int main() {
-    char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *handle;
-    struct bpf_program fp;
-    char filter_exp[] = "ip";  // You can modify this filter expression to capture specific traffic
-    const char *dev = "tailscale0";  // Change this to your network interface
+    try {
+        // ====== PHASE 1: USER INTERFACE ======
+        UserInterface::showWelcome();
 
-    bpf_u_int32 mask;
-    bpf_u_int32 net;
+        std::string device = UserInterface::promptForDevice();
+        std::string filter = UserInterface::promptForFilter();
+        int packet_limit = UserInterface::promptForPacketLimit();
+        uint32_t tempo = UserInterface::promptForTempo();
+        uint8_t octave_base = UserInterface::promptForOctaveBase();
 
-    // Open the network interface
-    handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
-    if (handle == nullptr) {
-        cerr << "Couldn't open device eth0: " << errbuf << '\n';
-        return(2);
+        // ====== PHASE 2: NETWORK CAPTURE ======
+        UserInterface::showCaptureInfo(device, filter, packet_limit);
+
+        std::string captured_file = "captured_traffic.bin";
+        bool capture_success = NetworkCapture::capturePackets(
+            device,
+            filter,
+            captured_file,
+            packet_limit,
+            1000  // 1 second timeout
+        );
+
+        if (!capture_success) {
+            std::cerr << "Error: Packet capture failed. Exiting.\n";
+            return 1;
+        }
+
+        // ====== PHASE 3: FILE PARSING ======
+        UserInterface::showParsingInfo(captured_file);
+
+        std::vector<ParsedEvent> events = FileParser::parseFile(
+            captured_file,
+            octave_base,
+            128  // Quarter note duration in ticks
+        );
+
+        if (events.empty()) {
+            std::cerr << "Error: No events parsed from file. Exiting.\n";
+            return 1;
+        }
+
+        // ====== PHASE 4: MIDI BUILDING ======
+        std::cout << "\n─── Building MIDI ───\n";
+
+        MidiBuilder midi;
+        midi.buildFromEvents(events, tempo);
+
+        // ====== PHASE 5: WRITE OUTPUT ======
+        std::string output_file = "output.mid";
+        midi.write(output_file);
+
+        UserInterface::showCompletion(output_file);
+
+        return 0;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << '\n';
+        return 1;
     }
-
-    // Get network number and mask associated with capture device
-    if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
-        net = 0;
-        mask = 0;
-    }
-
-    // Compile the filter expression
-    if (pcap_compile(handle, &fp, filter_exp, 0, net) == -1) {
-        cerr << "Couldn't parse filter " << filter_exp << ": "
-                  << pcap_geterr(handle) << '\n';
-        return(2);
-    }
-
-    // Apply the compiled filter
-    if (pcap_setfilter(handle, &fp) == -1) {
-        cerr << "Couldn't install filter " << filter_exp << ": "
-                  << pcap_geterr(handle) << '\n';
-        return(2);
-    }
-
-    // Open the output file
-    ofstream output_file("captured_traffic.txt", std::ios::binary);
-
-    // Capture packets in a loop
-    pcap_loop(handle, 0, packet_handler, (u_char*)&output_file);
-
-    // Cleanup
-    pcap_freecode(&fp);
-    pcap_close(handle);
-
-    return(0);
 }
